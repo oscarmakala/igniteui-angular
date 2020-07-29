@@ -3,11 +3,13 @@ import { WorkspaceSchema } from '@schematics/angular/utility/workspace-models';
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as ng from '@angular/language-service';
 import { ClassChanges, BindingChanges, SelectorChange, SelectorChanges, ThemePropertyChanges, ImportsChanges } from './schema';
-import { getLanguageService, getRenamePositions } from './tsUtils';
+import { getLanguageService, getRenamePositions, getNgLanguageService, getLanguageServiceHost, getNgServiceHost, toPath } from './tsUtils';
 import { getProjectPaths, getWorkspace, getProjects, escapeRegExp } from './util';
-import { LanguageService } from 'typescript';
-
+import { ServerHost } from './ServerHost';
+import { Logger } from './TSLogger';
+import ts = require('typescript/lib/tsserverlibrary');
 
 export enum InputPropertyType {
     EVAL = 'eval',
@@ -21,6 +23,8 @@ export interface BoundPropertyObject {
 
 // tslint:disable:arrow-parens
 export class UpdateChanges {
+    public projectService: ts.server.ProjectService;
+    protected serverHost: ServerHost;
     protected workspace: WorkspaceSchema;
     protected sourcePaths: string[];
     protected classChanges: ClassChanges;
@@ -58,7 +62,7 @@ export class UpdateChanges {
     }
 
     private _sassFiles: string[] = [];
-    /** Sass (both .scss and .sass) files in the project being updagraded. */
+    /** Sass (both .scss and .sass) files in the project being updated. */
     public get sassFiles(): string[] {
         if (!this._sassFiles.length) {
             // files can be outside the app prefix, so start from sourceRoot
@@ -73,12 +77,40 @@ export class UpdateChanges {
         return this._sassFiles;
     }
 
-    private _service: LanguageService;
-    public get service(): LanguageService {
+    private _service: ts.LanguageService;
+    public get service(): ts.LanguageService {
         if (!this._service) {
-            this._service = getLanguageService(this.tsFiles, this.host);
+            this._service = getLanguageService(this.serviceHost);
         }
         return this._service;
+    }
+
+    private _serviceHost: ts.LanguageServiceHost;
+    public get serviceHost(): ts.LanguageServiceHost {
+        if (!this._serviceHost) {
+            this._serviceHost = getLanguageServiceHost([...this.tsFiles, ...this.templateFiles], this.host);
+        }
+        return this._serviceHost;
+    }
+
+    private _ngService: ng.LanguageService;
+    public get ngService(): ng.LanguageService {
+        if (!this._ngService) {
+            this._ngService = getNgLanguageService(this.serviceHost, this.service);
+        }
+        return this._ngService;
+    }
+
+    private _ngServiceHost: ng.TypeScriptServiceHost;
+    public get ngServiceHost(): ng.TypeScriptServiceHost {
+        if (!this._ngServiceHost) {
+            this._ngServiceHost = getNgServiceHost(this.serviceHost, this.service);
+        }
+        return this._ngServiceHost;
+    }
+
+    public get currentDirectory() {
+        return this.serverHost.getCurrentDirectory();
     }
 
     /**
@@ -95,6 +127,8 @@ export class UpdateChanges {
         this.inputChanges = this.loadConfig('inputs.json');
         this.themePropsChanges = this.loadConfig('theme-props.json');
         this.importsChanges = this.loadConfig('imports.json');
+        this.serverHost = new ServerHost();
+        this.projectService = this.createProjectService();
     }
 
     /** Apply configured changes to the Host Tree */
@@ -144,6 +178,15 @@ export class UpdateChanges {
 
     public addValueTransform(functionName: string, callback: TransformFunction) {
         this.valueTransforms.set(functionName, callback);
+    }
+
+    public getDefaultLanguageService(entryPath: string): ts.LanguageService | undefined {
+        const tsEntryPath = toPath(this.currentDirectory + entryPath);
+        const scriptInfo = this.projectService.getOrCreateScriptInfoForNormalizedPath(ts.server.asNormalizedPath(tsEntryPath), false);
+        this.projectService.openClientFile(scriptInfo.fileName);
+        const project = this.projectService.findProject(scriptInfo.containingProjects[0].projectName);
+        project.addMissingFileRoot(scriptInfo.fileName);
+        return project.getLanguageService();
     }
 
     protected updateSelectors(entryPath: string) {
@@ -271,8 +314,9 @@ export class UpdateChanges {
                         transform(args);
                         if (args.bindingType !== bindingType) {
                             replaceStatement = args.bindingType === InputPropertyType.EVAL ?
-                            replaceStatement.replace(`$1`, `$1[`).replace(`$2`, `]$2`) :
-                            replaceStatement.replace(`$1`, regExpMatch[1].replace('[', '')).replace('$2', regExpMatch[2].replace(']', ''));
+                                replaceStatement.replace(`$1`, `$1[`).replace(`$2`, `]$2`) :
+                                replaceStatement.replace(`$1`,
+                                    regExpMatch[1].replace('[', '')).replace('$2', regExpMatch[2].replace(']', ''));
 
                         }
                         replaceStatement = replaceStatement.replace('$4', args.value);
@@ -433,6 +477,41 @@ export class UpdateChanges {
         }
         parts.push(body.substring(lastIndex));
         return parts;
+    }
+
+    private createProjectService(): ts.server.ProjectService {
+        const logger = new Logger(true, ts.server.LogLevel.verbose);
+        const projectService = new ts.server.ProjectService({
+            host: this.serverHost,
+            logger: logger,
+            cancellationToken: ts.server.nullCancellationToken,
+            useSingleInferredProject: true,
+            useInferredProjectPerProjectRoot: true,
+            typingsInstaller: ts.server.nullTypingsInstaller,
+            suppressDiagnosticEvents: true,
+            globalPlugins: ['@angular/language-service'],
+            eventHandler: () => { },
+            allowLocalPluginLoads: false,
+            // pluginProbeLocations: [],
+        });
+        projectService.setHostConfiguration({
+            formatOptions: projectService.getHostFormatCodeOptions(),
+            extraFileExtensions: [
+                {
+                    extension: '.html',
+                    isMixedContent: false,
+                    scriptKind: ts.ScriptKind.External,
+                }
+            ]
+        });
+        projectService.configurePlugin({
+            pluginName: '@angular/language-service',
+            configuration: {
+                angularOnly: false,
+            },
+        });
+
+        return projectService;
     }
 }
 
